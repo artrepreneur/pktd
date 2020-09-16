@@ -2498,7 +2498,7 @@ out:
 func setupRPCListeners() ([]net.Listener, er.R) {
 	// Setup TLS if not disabled.
 	listenFunc := net.Listen
-	if !cfg.DisableTLS {
+	if cfg.EnableTLS {
 		// Generate the TLS cert and key file if both don't already
 		// exist.
 		if !fileExists(cfg.RPCKey) && !fileExists(cfg.RPCCert) {
@@ -2879,6 +2879,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			AddrIndex:    s.addrIndex,
 			CfIndex:      s.cfIndex,
 			FeeEstimator: s.feeEstimator,
+			ServiceFlags: services,
 		})
 		if err != nil {
 			return nil, err
