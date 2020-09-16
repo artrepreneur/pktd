@@ -8,6 +8,7 @@ package wallet
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -2741,6 +2742,7 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType params.SigHashType,
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
 		for i, txIn := range tx.TxIn {
+			fmt.Println("****txIN", txIn)
 			prevPkScript, ok := additionalPrevScripts[txIn.PreviousOutPoint]
 			if ok {
 				tx.Additional[i].PkScript = prevPkScript
@@ -2780,6 +2782,7 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType params.SigHashType,
 					}
 					return wif.PrivKey, wif.CompressPubKey, nil
 				}
+
 				address, err := w.Manager.Address(addrmgrNs, addr)
 				if err != nil {
 					return nil, false, err
@@ -2798,6 +2801,7 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType params.SigHashType,
 
 				return key, pka.Compressed(), nil
 			})
+
 			getScript := txscript.ScriptClosure(func(addr btcutil.Address) ([]byte, er.R) {
 				// If keys were provided then we can only use the
 				// redeem scripts provided with our inputs, too.
@@ -2866,8 +2870,144 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType params.SigHashType,
 		}
 		return nil
 	})
+
+	// Fix for Multisig
+	if signErrors != nil {
+		return w.SignLegTransaction(tx, hashType, additionalPrevScripts, additionalKeysByAddress, p2shRedeemScriptsByAddress)
+	}
+
 	return signErrors, err
 }
+
+// Fix for Multisig
+func (w *Wallet) SignLegTransaction(tx *wire.MsgTx, hashType params.SigHashType,
+	additionalPrevScripts map[wire.OutPoint][]byte,
+	additionalKeysByAddress map[string]*btcutil.WIF,
+	p2shRedeemScriptsByAddress map[string][]byte) ([]SignatureError, er.R) {
+
+	var signErrors []SignatureError
+	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) er.R {
+		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+
+		for i, txIn := range tx.TxIn {
+			prevOutScript, ok := additionalPrevScripts[txIn.PreviousOutPoint]
+			if !ok {
+				prevHash := &txIn.PreviousOutPoint.Hash
+				prevIndex := txIn.PreviousOutPoint.Index
+				txDetails, err := w.TxStore.TxDetails(txmgrNs, prevHash)
+				if err != nil {
+					return er.Errorf("cannot query previous transaction "+
+						"details for %v: %v", txIn.PreviousOutPoint, err)
+				}
+				if txDetails == nil {
+					return er.Errorf("%v not found",
+						txIn.PreviousOutPoint)
+				}
+				prevOutScript = txDetails.MsgTx.TxOut[prevIndex].PkScript
+			}
+
+			// Set up our callbacks that we pass to txscript so it can
+			// look up the appropriate keys and scripts by address.
+			getKey := txscript.KeyClosure(func(addr btcutil.Address) (*btcec.PrivateKey, bool, er.R) {
+				if len(additionalKeysByAddress) != 0 {
+					addrStr := addr.EncodeAddress()
+					fmt.Println("addrStr",addrStr, addr)
+					wif, ok := additionalKeysByAddress[addrStr]
+					if !ok {
+						return nil, false,
+							er.New("no key for address")
+					}
+					return wif.PrivKey, wif.CompressPubKey, nil
+				}
+				address, err := w.Manager.Address(addrmgrNs, addr)
+				fmt.Println("address",address.Address().EncodeAddress(), addr)
+				if err != nil {
+					return nil, false, err
+				}
+
+				pka, ok := address.(waddrmgr.ManagedPubKeyAddress)
+				if !ok {
+					// Fix for Multisig
+					if strings.HasPrefix(address.Address().EncodeAddress(),"P"){
+						return nil, false, er.Errorf("Legacy Address or multisig")
+					} else {
+						return nil, false, er.Errorf("address %v is not "+
+							"a pubkey address", address.Address().EncodeAddress())
+					}
+				}
+
+				key, err := pka.PrivKey()
+				if err != nil {
+					return nil, false, err
+				}
+
+				return key, pka.Compressed(), nil
+			})
+			getScript := txscript.ScriptClosure(func(addr btcutil.Address) ([]byte, er.R) {
+				// If keys were provided then we can only use the
+				// redeem scripts provided with our inputs, too.
+				if len(additionalKeysByAddress) != 0 {
+					addrStr := addr.EncodeAddress()
+					script, ok := p2shRedeemScriptsByAddress[addrStr]
+					if !ok {
+						return nil, er.New("no script for address")
+					}
+					return script, nil
+				}
+				address, err := w.Manager.Address(addrmgrNs, addr)
+				if err != nil {
+					return nil, err
+				}
+				sa, ok := address.(waddrmgr.ManagedScriptAddress)
+				if !ok {
+					return nil, er.New("address is not a script" +
+						" address")
+				}
+
+				return sa.Script()
+			})
+
+			// SigHashSingle inputs can only be signed if there's a
+			// corresponding output. However this could be already signed,
+			// so we always verify the output.
+			if (hashType&params.SigHashSingle) !=
+				params.SigHashSingle || i < len(tx.TxOut) {
+
+				script, err := txscript.SignTxOutput(w.ChainParams(),
+					tx, i, prevOutScript, hashType, getKey,
+					getScript, txIn.SignatureScript)
+				// Failure to sign isn't an error, it just means that
+				// the tx isn't complete.
+				if err != nil {
+					signErrors = append(signErrors, SignatureError{
+						InputIndex: uint32(i),
+						Error:      err,
+					})
+					continue
+				}
+				txIn.SignatureScript = script
+			}
+
+			// Either it was already signed or we just signed it.
+			// Find out if it is completely satisfied or still needs more.
+			vm, err := txscript.NewEngine(prevOutScript, tx, i,
+				txscript.StandardVerifyFlags, nil, nil, 0)
+			if err == nil {
+				err = vm.Execute()
+			}
+			if err != nil {
+				signErrors = append(signErrors, SignatureError{
+					InputIndex: uint32(i),
+					Error:      err,
+				})
+			}
+		}
+		return nil
+	})
+	return signErrors, err
+}
+//
 
 // reliablyPublishTransaction is a superset of publishTransaction which contains
 // the primary logic required for publishing a transaction, updating the
